@@ -1,0 +1,27 @@
+name: release
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# npm releases are published from a maintainer's machine; this mirrors each release
+# to GitHub Packages as @rosehgal/potemkin-cli, so it shows under the repo's Packages.
+jobs:
+  github-packages:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: '@rosehgal'
+      - run: npm ci
+      - run: npm run typecheck && npm test
+      - run: npm pkg set name=@rosehgal/potemkin-cli
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
