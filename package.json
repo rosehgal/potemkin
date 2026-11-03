@@ -1,0 +1,57 @@
+{
+  "name": "potemkin-cli",
+  "version": "0.1.0",
+  "description": "Guts every function your coding agent changed and reruns the tests. Lists the tests that stay green anyway.",
+  "type": "module",
+  "bin": {
+    "potemkin": "dist/cli.js",
+    "potemkin-cli": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit && tsc -p test",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "coding-agent",
+    "mutation-testing",
+    "testing",
+    "vitest",
+    "jest",
+    "pytest",
+    "hooks",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rosehgal/potemkin.git"
+  },
+  "license": "MIT",
+  "author": "Rohit Sehgal",
+  "homepage": "https://github.com/rosehgal/potemkin#readme",
+  "bugs": {
+    "url": "https://github.com/rosehgal/potemkin/issues"
+  },
+  "dependencies": {
+    "@babel/parser": "^8.1.0",
+    "@fontsource/inter": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "@resvg/resvg-js": "^2.6.2",
+    "satori": "^0.63.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}
