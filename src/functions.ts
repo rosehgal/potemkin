@@ -44,6 +44,7 @@ function parseJs(file: string, src: string) {
     try {
       return parse(src, { sourceType: 'unambiguous', plugins, allowReturnOutsideFunction: true, errorRecovery: false });
     } catch (e) {
+      if (e instanceof RangeError) throw new Error('an expression is nested too deeply for the parser'); // Babel recurses per operand
       err = e;
     }
   }
