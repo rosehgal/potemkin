@@ -91,12 +91,14 @@ function make(root: string, kind: 'vitest' | 'jest', dir: string, names: string[
 // or `node --experimental-vm-modules node_modules/.bin/jest`.
 function scriptEnv(script: string, kind: string): Record<string, string> {
   const env: Record<string, string> = {};
-  const m = /^(?:\s*(?:cross-env\s+)?(?:[A-Z_][A-Z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s*))+/.exec(script);
-  for (const kv of (m?.[0] ?? '').matchAll(/([A-Z_][A-Z0-9_]*)=("[^"]*"|'[^']*'|\S*)/g)) {
+  const m = /^(?:\s*(?:env\s+|cross-env(?:-shell)?\s+)?(?:[A-Z_][A-Z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|]*)\s*))+/.exec(script);
+  for (const kv of (m?.[0] ?? '').matchAll(/([A-Z_][A-Z0-9_]*)=("[^"]*"|'[^']*'|[^\s;&|]*)/g)) {
     if (['PATH', 'HOME', 'CI'].includes(kv[1])) continue;
-    env[kv[1]] = kv[2].replace(/^["']|["']$/g, '').replace(/\$\{?NODE_OPTIONS\}?/g, '').trim();
+    const v = kv[2].replace(/^["']|["']$/g, '').replace(/\$\{?NODE_OPTIONS\}?/g, '').trim();
+    if (v) env[kv[1]] = v;
   }
-  const flags = new RegExp(`\\bnode\\s+((?:--?[\\w-]+(?:=\\S+)?\\s+)+)\\S*${kind}`).exec(script);
+  // `node --experimental-vm-modules node_modules/.bin/jest`, `node -r dotenv/config …jest`
+  const flags = new RegExp(`\\bnode\\s+((?:(?:-r|--require|--import|--loader|--experimental-loader)\\s+\\S+\\s+|--?[\\w-]+(?:=\\S+)?\\s+)+)\\S*${kind}`).exec(script);
   if (flags) env.NODE_OPTIONS = [env.NODE_OPTIONS, flags[1].trim()].filter(Boolean).join(' ');
   return env;
 }
@@ -107,8 +109,13 @@ function otherConfigs(names: string[], pkg: any, kind: 'vitest' | 'jest'): strin
   const out = new Set<string>();
   for (const n of names)
     if (!main.test(n) && /^(?:vitest|jest)\.config\.[\w-]+\.[\w]+$|^(?:playwright|cypress)\.config\.[cm]?[jt]s$|^wdio\.conf(?:ig)?\.[cm]?[jt]s$/.test(n)) out.add(n);
-  for (const script of Object.values(pkg?.scripts ?? {}) as string[])
-    for (const m of script.matchAll(/(?:--config|-c)[=\s]+([^\s'"&;|]+)/g)) if (!main.test(m[1].split('/').at(-1)!)) out.add(m[1]);
+  for (const script of Object.values(pkg?.scripts ?? {}) as string[]) {
+    if (!/\b(?:vitest|jest|playwright|cypress|mocha|wdio)\b/.test(script)) continue;
+    for (const m of script.matchAll(/(?:--config|-c)[=\s]+([^\s'"&;|]+)/g)) {
+      const v = m[1];
+      if (/\.(?:config|conf)\.|\.(?:[cm]?[jt]s|json)$/.test(v) && !main.test(v.split('/').at(-1)!)) out.add(v);
+    }
+  }
   return [...out];
 }
 
@@ -133,7 +140,8 @@ export function pythonFor(root: string, file = ''): string {
 }
 
 const probes = new Map<string, { pytest: boolean; cov: boolean }>();
-export function runnerFor(root: string, file: string): Runner | string {
+/** `tests`: the repo's Python test files, so pytest starts where they are, not only where the source is. */
+export function runnerFor(root: string, file: string, tests: string[] = []): Runner | string {
   if (!file.endsWith('.py')) return jsRunner(root, file);
   const python = pythonFor(root, file);
   if (!probes.has(python)) {
@@ -142,14 +150,18 @@ export function runnerFor(root: string, file: string): Runner | string {
   }
   const p = probes.get(python)!;
   if (!p.pytest) return `pytest is not installed for ${python}`;
-  // pytest reads its config from the nearest ini-style file above the tests, so start there.
+  // pytest reads its config from the nearest ini-style file above the source, so start there,
+  // unless the tests live elsewhere: then the repo root, where a whole-suite run collects them.
+  const INI = ['pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini'];
   let dir = '';
   for (let d: string | undefined = up(file) ?? ''; d !== undefined; d = up(d))
-    if (['pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini'].some((n) => existsSync(join(root, d!, n)))) {
+    if (INI.some((n) => existsSync(join(root, d!, n)))) {
       dir = d;
       break;
     }
-  return { kind: 'pytest', dir, exe: python, major: 0, env: {}, configs: [], noCov: p.cov };
+  if (dir && tests.length && !tests.some((t) => t.startsWith(`${dir}/`))) dir = '';
+  const ini = INI.map((n) => readText(join(root, dir, n))).join('\n');
+  return { kind: 'pytest', dir, exe: python, major: 0, env: {}, configs: [], noCov: p.cov && !/-p\s*no:(?:cov|pytest_cov)\b/.test(ini) };
 }
 
 // Python has no import graph to ask, so related tests are the test files that name the module.
@@ -183,7 +195,8 @@ export function command(r: Runner, sandbox: string, work: string, sel: Selection
     return [join(sandbox, r.exe), ...pick, '--json', `--outputFile=${out}`, '--passWithNoTests', '--ci', '--coverage=false', '--no-watchman', '--forceExit', `--cacheDirectory=${join(work, 'jest-cache')}`];
   }
   const pick = sel === 'all' ? [] : 'related' in sel ? abs(sel.related) : abs(sel.files);
-  return [r.exe, '-m', 'pytest', '-q', '-o', `cache_dir=${join(work, 'pytest-cache')}`, '-o', 'junit_family=xunit1', `--junitxml=${out}`, ...(r.noCov ? ['--no-cov'] : []), ...pick];
+  // rootdir at the sandbox: junit file= attributes come out repo-relative, whatever directory pytest starts in.
+  return [r.exe, '-m', 'pytest', '-q', `--rootdir=${sandbox}`, '-o', `cache_dir=${join(work, 'pytest-cache')}`, '-o', 'junit_family=xunit1', `--junitxml=${out}`, ...(r.noCov ? ['--no-cov'] : []), ...pick];
 }
 
 export async function runTests(r: Runner, sandbox: string, work: string, sel: Selection, timeoutMs: number): Promise<Run> {

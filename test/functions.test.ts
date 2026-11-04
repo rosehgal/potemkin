@@ -83,9 +83,11 @@ class A { accessor y = 1; z = () => ({ a: 1 }); }
 test('functions that already do nothing are flagged inert, and their EMPTY mutant is the code itself', () => {
   const src = `export function noop() {}\nexport const nothing = () => undefined;\nexport function bare() { return; }\nexport function assertNever(x: never): never { throw new Error('x'); }\nclass L { debug(_m: string): void {} }\nexport function real() { return 1; }\n`;
   const fns = jsFunctions('c.ts', src);
-  assert.deepEqual(fns.map((f) => `${f.name}${f.inert ? '!' : ''}`), ['noop!', 'nothing!', 'bare!', 'assertNever!', 'L.debug!', 'real']);
+  assert.deepEqual(fns.map((f) => `${f.name}${f.inert ? '!' : ''}`), ['noop!', 'nothing!', 'bare!', 'assertNever', 'L.debug!', 'real']); // a throw is behaviour
   assert.equal(jsMutant(src, fns[0], 'empty'), src);
   assert.notEqual(jsMutant(src, fns[0], 'throw'), src);
+  const voids = `export const a = () => void 0;\nexport const b = () => void save();\nexport const c = () => undefined;\n`;
+  assert.deepEqual(jsFunctions('v.ts', voids).map((f) => `${f.name}${f.inert ? '!' : ''}`), ['a!', 'b', 'c!']);
 });
 
 test('nested functions are named by what encloses them, and siblings get #2', () => {
@@ -108,6 +110,11 @@ test('fingerprints ignore formatting and comments, and a nested edit only change
   const j = (src: string) => jsFunctions('a.tsx', src)[0].fp;
   assert.equal(j(`export const Card = () => <div className="c">\n  {/* title */}\n  Hello\n</div>;\n`), j(`export const Card = () => (\n  <div className="c">Hello</div>\n);\n`));
   assert.notEqual(j(`export const Card = () => <div className="c">Hello</div>;`), j(`export const Card = () => <div className="c">Hi</div>;`));
+  assert.notEqual(j(`export const T = () => <b>x y</b>;`), j(`export const T = () => <b>x  y</b>;`)); // React keeps spaces inside a line
+  // Types, bigint literals and TS wrappers: only runtime structure counts
+  assert.equal(fp(`export function add(a: number, b: number): number { return a + b; }`).add, fp(`export function add(a, b) { return a + b; }`).add);
+  assert.equal(fp(`export function big(xs: bigint[]) { return xs.reduce((s, x) => s + x, 0n); }`).big, fp(`// note\nexport function big(xs) { return xs.reduce((s, x) => s + x, 0n) }`).big);
+  assert.notEqual(fp(`export function big() { return 1n; }`).big, fp(`export function big() { return 2n; }`).big);
 });
 
 test('line numbers count \\n only, as git does', () => {
@@ -198,8 +205,10 @@ def emoji(s="🎉✓"): return s + "✓"
 `,
   );
   const fns = pyFunctions('python3', 'repo.py', file);
-  assert.deepEqual(fns.map((f) => `${f.name}@${f.line}${f.inert ? '!' : ''}`), ['Repo.size@8', 'Repo.size.setter@13', 'Repo.make@17', 'Repo.fetch@20', 'Repo.gen@23', 'Repo.never@29!', 'outer@33', 'outer.inner@34', 'emoji@38']);
-  assert.equal(pyMutant('python3', file, fns.find((f) => f.name === 'Repo.never')!, 'empty'), readFileSync(file, 'utf8'));
+  assert.deepEqual(fns.map((f) => `${f.name}@${f.line}${f.inert ? '!' : ''}`), ['Repo.size@8', 'Repo.size.setter@13', 'Repo.make@17', 'Repo.fetch@20', 'Repo.gen@23', 'Repo.never@29', 'outer@33', 'outer.inner@34', 'emoji@38']);
+  const stubs = pyFunctions('python3', 's.py', '-', 'def a():\n    pass\ndef b():\n    return None\ndef c():\n    return\ndef d(x: int) -> int:\n    return x\n');
+  assert.deepEqual(stubs.map((f) => `${f.name}${f.inert ? '!' : ''}`), ['a!', 'b!', 'c!', 'd']);
+  assert.equal(stubs[3].fp, pyFunctions('python3', 's.py', '-', 'def d(x):\n    return x\n')[0].fp); // annotations are not behaviour
   const doc = (text: string) => pyFunctions('python3', 'x.py', '-', text)[0].fp; // a reworded docstring is not a change
   assert.equal(doc('def f():\n    DOC_ONE\n    return 1\n'.replace('DOC_ONE', TQ + 'One.' + TQ)), doc('def f():\n    DOC_TWO\n    return 1\n'.replace('DOC_TWO', TQ + 'Two, reworded.' + TQ)));
   for (const fn of fns) for (const kind of ['empty', 'throw'] as const) pyMutant('python3', file, fn, kind, '/tmp/m'); // the script verifies every mutant

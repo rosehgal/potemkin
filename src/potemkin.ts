@@ -112,41 +112,42 @@ function changedFunctions(root: string, base: string, diff: { files: Map<string,
       return []; // unreadable or unparseable before: every function counts as changed
     }
   };
-  let gone: Fn[] | undefined; // functions of deleted files, for moves: parsed once, on demand
-  const fromDeleted = () => (gone ??= diff.deleted.filter(isSource).flatMap((p) => atBase(p, p)));
+  const current = new Map<string, Fn[]>();
+  const previous = new Map<string, Fn[]>();
   for (const [file, old] of diff.files) {
     if (!isSource(file)) continue;
     const abs = join(root, file);
     if (!existsSync(abs) || lstatSync(abs).isSymbolicLink()) continue;
-    let now: Fn[];
     try {
-      now = list(file, file, readFileSync(abs, 'utf8'), abs);
+      current.set(file, list(file, file, readFileSync(abs, 'utf8'), abs));
     } catch (e) {
       skipped.push({ file, name: '(whole file)', line: 1, why: `could not parse it: ${(e as Error).message.split('\n')[0]}` });
       continue;
     }
-    const before = old === null ? [] : atBase(file, old);
-    const free = new Set([...before, ...fromDeleted()]);
-    const take = (pred: (f: Fn) => boolean) => {
-      for (const f of free)
-        if (pred(f)) {
-          free.delete(f);
-          return f;
-        }
-      return undefined;
-    };
-    for (const f of now) {
-      const same = take((b) => b.file === file && baseName(b.name) === baseName(f.name) && b.fp === f.fp); // unchanged, maybe reordered
-      if (same) continue;
-      const moved = take((b) => leaf(b.name) === leaf(f.name) && b.fp === f.fp); // another file, a renamed class
-      if (moved) continue;
-      if (f.inert) {
-        // Gutted by the diff itself: a real change. New and empty, or empty before too: nothing to test.
-        const was = before.filter((b) => baseName(b.name) === baseName(f.name));
-        if (!was.length || was.every((b) => b.inert)) continue;
+    previous.set(file, old === null ? [] : atBase(file, old));
+  }
+  // Every base function the diff touched, deleted files included: the pool a moved function is matched against.
+  const pool = new Set([...[...previous.values()].flat(), ...diff.deleted.filter(isSource).flatMap((p) => atBase(p, p))]);
+  const take = (pred: (f: Fn) => boolean) => {
+    for (const f of pool)
+      if (pred(f)) {
+        pool.delete(f);
+        return f;
       }
-      out.push(f);
+    return undefined;
+  };
+  // Exact matches first for everything, then moves for what is left: an edit that makes A look like
+  // its untouched sibling B must not steal B's match and leave B looking changed.
+  const unmatched: Fn[] = [];
+  for (const [file, now] of current) for (const f of now) if (!take((b) => b.file === file && baseName(b.name) === baseName(f.name) && b.fp === f.fp)) unmatched.push(f);
+  for (const f of unmatched) {
+    if (take((b) => leaf(b.name) === leaf(f.name) && b.fp === f.fp)) continue; // another file, a renamed class
+    if (f.inert) {
+      // Gutted by the diff itself: a real change. New and empty, or empty before too: nothing to test.
+      const was = (previous.get(f.file) ?? []).filter((b) => baseName(b.name) === baseName(f.name));
+      if (!was.length || was.every((b) => b.inert)) continue;
     }
+    out.push(f);
   }
   return out;
 }
@@ -435,7 +436,8 @@ export async function check(opt: Options): Promise<Report> {
 
   // Runners first: a setup problem should not cost a copy of the repo.
   const runners = new Map<string, Runner | string>();
-  for (const f of chosen) if (!runners.has(f.file)) runners.set(f.file, runnerFor(root, f.file));
+  const pyTests = git(root, ['ls-files', '-co', '--exclude-standard', '-z']).split('\0').filter((f) => /(?:^|\/)(?:test_[^/]*|[^/]*_test)\.py$/.test(f));
+  for (const f of chosen) if (!runners.has(f.file)) runners.set(f.file, runnerFor(root, f.file, pyTests));
   const setup = [...runners.values()].filter((r): r is string => typeof r === 'string');
   if (setup.length === runners.size) throw new SetupError(setup[0]);
 
@@ -492,7 +494,7 @@ export async function check(opt: Options): Promise<Report> {
       };
       const baseline = async (sel: Selection): Promise<Baseline> => {
         const a = await run(sel);
-        if (!a.results) return { error: explain(runner, a, opt.timeoutMs, sel) };
+        if (!a.results) return { error: explain(runner, a, opt.timeoutMs, sel, sb.dir) };
         const r = new Map(a.results);
         if ([...r.values()].includes('fail')) {
           const b = await run(sel); // flaky or order-dependent: a pass in either run counts
@@ -558,16 +560,19 @@ export async function check(opt: Options): Promise<Report> {
       }
       rmSync(marker, { force: true });
       const loadRun = await run('all', canary(file, original, marker));
-      const loadedQuietly = existsSync(marker); // loaded, but every error was caught by a fallback
+      // Test files whose failure mentions the canary load this file; a pytest collection error counts for its whole file.
+      const canaryFiles = new Set([...loadRun.messages].filter(([, m]) => /potemkin canary/.test(m)).map(([id]) => testFile(id)).filter(Boolean));
+      const loadedQuietly = existsSync(marker) && !canaryFiles.size; // loaded, but every error was caught by a fallback
       let loaders = red(loadRun, fb.pass);
-      // Tests that already fail might check this function: the ones whose failure now mentions the canary load it.
-      const brokenLoaders = loadRun.results ? [...fb.fail].filter((id) => /potemkin canary/.test(loadRun.messages.get(id) ?? '')) : [...fb.fail];
+      if (runner.kind === 'pytest' && loaders !== null && canaryFiles.size) loaders = [...fb.pass].filter((id) => canaryFiles.has(testFile(id))); // only the files whose import broke, not the whole aborted session
+      if (loaders === null && runner.kind === 'pytest' && existsSync(marker)) loaders = [...fb.pass]; // a conftest imports it: pytest aborts at collection, so every test counts as a loader
+      // Tests that already fail might check this function: the ones whose file the canary broke load it.
+      const brokenLoaders = loadRun.results ? [...fb.fail].filter((id) => canaryFiles.has(testFile(id)) || /potemkin canary/.test(loadRun.messages.get(id) ?? '')) : [...fb.fail];
       const brokenRelated = relSel === 'all' ? [] : [...rb.fail]; // runner-related failures; a name grep is not evidence
       const broken = [...new Set([...brokenRelated, ...brokenLoaders])];
       const brokenNote = broken.length
         ? `${plural(broken.length, 'test')} that might check it already ${broken.length === 1 ? 'fails' : 'fail'} on the current code, before Potemkin changed anything (${broken[0]})`
         : '';
-      if (loaders === null && runner.kind === 'pytest' && !loadedQuietly) loaders = [...fb.pass]; // a conftest imports it: pytest aborts at collection, so every test counts as a loader
       if (loaders === null) {
         for (const fn of candidates) add(fn, 'UNVERIFIABLE', [], 'the whole suite crashed when this file threw on import, so Potemkin cannot tell which tests load it');
         continue;
@@ -595,6 +600,15 @@ export async function check(opt: Options): Promise<Report> {
           continue;
         }
         const make = mutants.get(fn)!;
+        if (fn.inert) {
+          // The diff emptied it, so there is nothing left to gut. Say who runs it, and leave the judgement to the reader.
+          rmSync(marker, { force: true });
+          const t = await run(sel, make('throw', marker));
+          const callers = t.results ? red(t, pass)! : [];
+          const ran = callers.length > 0 || existsSync(marker);
+          add(fn, ran ? 'UNVERIFIABLE' : 'UNTESTED', callers, ran ? `the diff emptied this function, and ${callers.length ? plural(callers.length, 'test runs', 'tests run') : 'tests run'} it: whether its tests check that is for you to judge` : 'the diff emptied this function, and no test that loads its file calls it');
+          continue;
+        }
         const gone = await gutted(sel, make('empty'), pass);
         if (gone === null || gone.length) {
           const extra = gone?.filter((id) => !rb.pass.has(id)) ?? [];
@@ -628,10 +642,10 @@ export async function check(opt: Options): Promise<Report> {
   return { ...report, tests: seen.size, excluded: [...left].filter((id) => !seen.has(id)).length, ms: Date.now() - t0 };
 }
 
-function explain(r: Runner, run: Run, timeoutMs: number, sel: Selection): string {
+function explain(r: Runner, run: Run, timeoutMs: number, sel: Selection, sandbox: string): string {
   if (run.timedOut) return `${r.kind} timed out after ${Math.round(timeoutMs / 1000)}s (try a larger --timeout)`;
-  const lines = run.tail.split('\n').map((l) => l.trim()).filter(Boolean);
-  const why = lines.find((l) => /error|cannot|not found|failed|missing|ERR_|exception/i.test(l) && !/^at\s|JSON report written/i.test(l)) ?? lines.at(-1) ?? 'no output';
+  const lines = run.tail.replaceAll(`${sandbox}/`, '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const why = lines.find((l) => /error|cannot|not found|failed|missing|ERR_|exception/i.test(l) && !/^at\s|JSON report written|^(?:ERROR: )?usage:/i.test(l)) ?? lines.at(-1) ?? 'no output';
   const files = sel === 'all' ? '' : 'related' in sel ? sel.related.join(' ') : sel.files.join(' ');
   const repro =
     r.kind === 'vitest'

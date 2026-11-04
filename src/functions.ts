@@ -40,9 +40,10 @@ function parseJs(file: string, src: string) {
     if (jsx && !/x$/.test(file)) tries.push(base);
   }
   let err: unknown;
+  const text = src.startsWith('\ufeff') ? ` ${src.slice(1)}` : src; // a BOM before a shebang trips Babel; same length keeps offsets
   for (const plugins of tries) {
     try {
-      return parse(src, { sourceType: 'unambiguous', plugins, allowReturnOutsideFunction: true, errorRecovery: false });
+      return parse(text, { sourceType: 'unambiguous', plugins, allowReturnOutsideFunction: true, errorRecovery: false });
     } catch (e) {
       if (e instanceof RangeError) throw new Error('an expression is nested too deeply for the parser'); // Babel recurses per operand
       err = e;
@@ -61,23 +62,21 @@ function fnIn(n: any, depth = 0): any {
   n = unwrap(n);
   if (FN_TYPES.has(n?.type)) return n;
   if (n?.type !== 'CallExpression' || depth > 3 || !wrapper(n.callee)) return undefined;
-  for (const a of n.arguments) {
-    const f = fnIn(a, depth + 1);
-    if (f) return f;
-  }
-  return undefined;
+  const fns = n.arguments.map((a: any) => fnIn(a, depth + 1)).filter(Boolean);
+  return fns.length === 1 ? fns[0] : undefined; // createSelector(a, b): no single function stands for the name
 }
 const keyName = (k: any, src: string): string =>
   k?.type === 'Identifier' ? k.name : k?.type === 'PrivateName' ? `#${k.id?.name ?? k.name}` : k?.type === 'StringLiteral' ? k.value : src.slice(k.start, k.end);
 const SKIP_KEYS = new Set(['loc', 'extra', 'leadingComments', 'trailingComments', 'innerComments', 'comments', 'tokens', 'start', 'end', 'range']);
 
-// Bodies that already do nothing (or only throw): gutting them changes nothing worth reporting.
+// Bodies that already do nothing: gutting them changes nothing, so the baseline is the gutted run.
+const nothing = (e: any) => !e || (e.type === 'Identifier' && e.name === 'undefined') || (e.type === 'UnaryExpression' && e.operator === 'void' && /Literal$/.test(e.argument?.type ?? '')); // undefined, void 0
 function inert(body: any): boolean {
-  if (body.type !== 'BlockStatement') return body.type === 'Identifier' ? body.name === 'undefined' : body.type === 'UnaryExpression' && body.operator === 'void';
+  if (body.type !== 'BlockStatement') return nothing(body);
   if (body.body.length === 0) return true;
   if (body.body.length !== 1) return false;
   const s = body.body[0];
-  return s.type === 'ThrowStatement' || (s.type === 'ReturnStatement' && (!s.argument || (s.argument.type === 'Identifier' && s.argument.name === 'undefined')));
+  return s.type === 'ReturnStatement' && nothing(s.argument);
 }
 
 export function jsFunctions(file: string, src: string): Fn[] {
@@ -120,9 +119,11 @@ export function jsFunctions(file: string, src: string): Fn[] {
     const kind = (k: string) => (k === 'get' || k === 'set' ? `${k} ` : '');
     switch (n.type) {
       case 'ClassDeclaration':
-      case 'ClassExpression':
-        scope = n.id?.name ?? n.__name ?? (n.type === 'ClassDeclaration' ? 'default' : 'class');
+      case 'ClassExpression': {
+        const name = n.id?.name ?? n.__name ?? (n.type === 'ClassDeclaration' ? 'default' : 'class');
+        scope = outerScope ? `${outerScope}.${name}` : name;
         break;
+      }
       case 'FunctionDeclaration':
         add(n.id?.name ?? 'default', n, n, outerScope);
         break;
@@ -192,13 +193,28 @@ export function jsFunctions(file: string, src: string): Fn[] {
 
 // Structural fingerprint: positions, comments, quotes and formatting are ignored, and nested
 // named functions are placeholders, so an edit counts only against the function it is in.
+const TYPE_KEYS = new Set(['typeAnnotation', 'returnType', 'typeParameters', 'superTypeParameters', 'typeArguments', 'declare', 'definite', 'optional', 'accessibility', 'override', 'readonly']);
+// JSX text as React sees it (Babel's cleanJSXElementLiteralChild): lines trimmed on the inner side, empty lines dropped.
+function jsxText(t: string): string {
+  const lines = t.split(/\r\n|\n|\r/);
+  const out: string[] = [];
+  lines.forEach((line, i) => {
+    let l = line.replace(/\t/g, ' ');
+    if (i !== 0) l = l.replace(/^ +/, '');
+    if (i !== lines.length - 1) l = l.replace(/ +$/, '');
+    if (l) out.push(l);
+  });
+  return out.join(' ');
+}
+
 function fingerprint(outer: any, self: any, fns: Set<any>, src: string): string {
-  const jsxText = (t: string) => t.split('\n').map((l) => l.trim()).filter(Boolean).join(' '); // what React renders
   try {
     const noise = (x: any) => (x?.type === 'JSXText' && !jsxText(x.value)) || (x?.type === 'JSXExpressionContainer' && x.expression?.type === 'JSXEmptyExpression'); // whitespace, {/* comment */}
     return JSON.stringify(outer, (k, v) => {
-      if (SKIP_KEYS.has(k) || k === '__name') return undefined;
+      if (SKIP_KEYS.has(k) || TYPE_KEYS.has(k) || k === '__name') return undefined; // types are not behaviour
+      if (typeof v === 'bigint') return `${v}n`;
       if (!v || typeof v !== 'object') return v;
+      if (/^TS(?:AsExpression|SatisfiesExpression|NonNullExpression|TypeAssertion)$/.test(v.type)) return v.expression;
       if (Array.isArray(v)) return v.filter((x) => !noise(x));
       if (v !== self && fns.has(v)) return 'fn';
       if (v.type === 'JSXText') return { type: 'JSXText', value: jsxText(v.value) };
@@ -261,7 +277,10 @@ src = raw.decode("utf-8-sig")
 tree = ast.parse(src)
 
 def is_stub(fn):
-    return all(isinstance(s, ast.Pass) or (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)) for s in fn.body)
+    body = fn.body[1:] if len(fn.body) > 1 and is_docstring(fn.body[0]) else fn.body
+    def none(s):
+        return isinstance(s, ast.Pass) or (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)) or (isinstance(s, ast.Return) and (s.value is None or (isinstance(s.value, ast.Constant) and s.value.value is None)))
+    return all(none(s) for s in body)
 
 def only_raises(fn):
     body = fn.body[1:] if len(fn.body) > 1 and is_docstring(fn.body[0]) else fn.body
@@ -301,10 +320,17 @@ class Strip(ast.NodeTransformer):
     def __init__(self, root):
         self.root = root
     def visit_FunctionDef(self, node):
-        if node is self.root:
-            return self.generic_visit(node)
-        return ast.Name(id="def " + node.name)
+        if node is not self.root:
+            return ast.Name(id="def " + node.name)
+        node.returns = None  # annotations are not behaviour
+        return self.generic_visit(node)
     visit_AsyncFunctionDef = visit_FunctionDef
+    def visit_arg(self, node):
+        node.annotation = None
+        return node
+    def visit_AnnAssign(self, node):
+        node.annotation = ast.Constant(value=None)
+        return self.generic_visit(node)
 
 def fingerprint(fn):
     c = copy.deepcopy(fn)
@@ -331,12 +357,12 @@ if mode == "list":
         if skip:
             continue
         start = min([fn.lineno] + [d.lineno for d in fn.decorator_list])
-        out.append({"name": name if seen[name] == 1 else name + "#" + str(seen[name]), "line": start, "end": fn.end_lineno, "index": index, "fp": fingerprint(fn), "inert": is_stub(fn) or only_raises(fn)})
+        out.append({"name": name if seen[name] == 1 else name + "#" + str(seen[name]), "line": start, "end": fn.end_lineno, "index": index, "fp": fingerprint(fn), "inert": is_stub(fn)})
     sys.stdout.write(json.dumps(out))
 else:
     idx, kind, marker = int(sys.argv[3]), sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else ""
     fn = fns[idx][1]
-    if kind == "empty" and (is_stub(fn) or only_raises(fn)):
+    if kind == "empty" and is_stub(fn):
         sys.stdout.buffer.write(raw)  # it already does nothing: the baseline is the gutted run
         raise SystemExit(0)
     lines = [l + "\n" for l in src.split("\n")]  # ast counts \n only; splitlines() would also split on \f,  …

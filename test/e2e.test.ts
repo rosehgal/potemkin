@@ -164,8 +164,21 @@ test('moved files, renamed classes and reordered same-named functions are not ch
   );
   const { v, out } = verdicts(dir);
   assert.deepEqual(Object.keys(v).sort(), ['clear', 'comments.create']);
-  assert.equal(v.clear.verdict, 'HOLLOW'); // the test runs it and asserts nothing
-  assert.equal(out.survive, 2);
+  assert.equal(v.clear.verdict, 'UNVERIFIABLE'); // the diff emptied it: nothing left to gut, so no accusation
+  assert.match(v.clear.why, /the diff emptied this function, and 1 test runs it/);
+  assert.equal(out.survive, 1);
+});
+
+test('an edit that makes one function look like its sibling blames the edited one', () => {
+  const dir = repo(
+    {
+      'src/pair.ts': 'export function a(x: number) {\n  return x + 1;\n}\nexport function b(x: number) {\n  return x + 2;\n}\n',
+      'test/pair.test.ts': "import { expect, test } from 'vitest';\nimport { a, b } from '../src/pair';\ntest('a', () => {\n  expect(a(1)).toBe(2);\n});\ntest('b', () => {\n  expect(b(1)).toBe(3);\n});\n",
+    },
+    { 'src/pair.ts': 'export function a(x: number) {\n  return x + 2;\n}\nexport function b(x: number) {\n  return x + 2;\n}\n' },
+  );
+  const { v } = verdicts(dir);
+  assert.deepEqual(Object.keys(v), ['a']);
 });
 
 test('falls back to the last commit when nothing is uncommitted; --base diffs from the branch point', () => {
