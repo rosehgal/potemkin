@@ -7,7 +7,7 @@ Set Shell bash
 Set Theme "Catppuccin Mocha"
 Set FontSize 19
 Set Width 1240
-Set Height 760
+Set Height 720
 Set Padding 28
 Set TypingSpeed 55ms
 Set WindowBar Colorful

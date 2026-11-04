@@ -49,14 +49,14 @@ export function facade(hollow: boolean) {
     row(),
     div({ width: 70, height: 100, background: INK, borderRadius: '35px 35px 0 0' }),
   );
-  if (!hollow) return div({ alignItems: 'flex-end', flexShrink: 0 }, front, div({ width: 90, height: 348, background: SIDE }));
+  if (!hollow) return div({ alignItems: 'flex-end', flexShrink: 0 }, front, div({ width: 90, height: 382, background: SIDE })); // 330 + padding + roof
   const brace = (h: number, deg: number) =>
     div({ position: 'absolute', right: 0, bottom: 0, width: 12, height: h, background: WOOD, transformOrigin: 'bottom right', transform: `rotate(${-deg}deg)` });
   return div(
     { alignItems: 'flex-end', flexShrink: 0 },
     front,
     div(
-      { width: 150, height: 348, position: 'relative', borderBottom: `6px solid ${WOOD}` },
+      { width: 150, height: 382, position: 'relative', borderBottom: `6px solid ${WOOD}` },
       brace(272, 31),
       brace(192, 48),
       div({ position: 'absolute', right: 0, top: 40, fontFamily: MONO, fontSize: 18, color: WOOD }, 'nothing here'),

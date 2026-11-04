@@ -295,9 +295,17 @@ async function main(argv: string[]) {
   if (!(timeout > 0 && timeout <= 3600)) throw new UsageError(`--timeout must be a number of seconds between 1 and 3600 (got "${opt.timeout}")`);
   if (command) return install(command === 'uninstall');
 
-  const progress = !opt.json || process.stderr.isTTY;
-  const log = progress ? (line: string) => process.stderr.write(`${err('dim', line)}\n`) : undefined;
+  // On a terminal, progress is one line that rewrites itself; in a log file, one line per step.
+  const tty = process.stderr.isTTY;
+  const log = !opt.json || tty
+    ? (line: string) => {
+        if (!tty) return void process.stderr.write(`${line}\n`);
+        const width = (process.stderr.columns || 80) - 1;
+        process.stderr.write(`\r\x1b[2K${err('dim', line.length > width ? `${line.slice(0, width - 1)}…` : line)}`);
+      }
+    : undefined;
   const r = await check({ cwd: process.cwd(), base: opt.base, max, timeoutMs: timeout * 1000, log });
+  if (tty && log) process.stderr.write('\r\x1b[2K');
   let file: string | undefined;
   let cardNote = '';
   if (opt.share || opt.out) {

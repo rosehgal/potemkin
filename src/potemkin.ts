@@ -341,7 +341,7 @@ export async function check(opt: Options): Promise<Report> {
   const setup = [...runners.values()].filter((r): r is string => typeof r === 'string');
   if (setup.length === runners.size && !/symlink/.test(setup[0])) throw new SetupError(setup[0]);
 
-  log(`Copying ${root} to a sandbox…`);
+  log(`Copying ${basename(root)} to a sandbox…`);
   const seen = new Set<string>();
   const left = new Set<string>();
   const full = new Map<string, Promise<Baseline>>(); // whole-suite baseline, once per runner
