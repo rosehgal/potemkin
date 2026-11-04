@@ -40,7 +40,7 @@ The headline counts HOLLOW plus UNTESTED: functions that could be deleted outrig
 ## How it works
 
 ```
-git diff ──▶ functions whose structure changed (comments and formatting do not count)
+git diff ──▶ functions whose structure changed (comments, formatting, moves and renames do not count)
                                    │
             a copy of the repo in $TMPDIR (dependencies linked in, caches kept inside)
                                    │
@@ -90,7 +90,22 @@ The card names functions and the repo folder, so read it before you post it. Fun
 
 ## Real numbers
 
-REAL_NUMBERS
+The author's own Next.js app, last commit (26 files, +2352 lines, written by an agent), on a laptop with no database running:
+
+```
+Potemkin · 38 functions changed since HEAD~1 · vitest · 229 tests · 63 runs in 1m 52s
+
+  NOTICED        23  a test failed with it gutted
+  HOLLOW          0  tests run it, yet all pass with it gutted
+  UNTESTED        3  no test that loads its file calls it
+  UNVERIFIABLE   12  Potemkin could not tell
+
+3 of 26 functions could be gutted, and every test would still pass.
+12 more functions could not be checked (below).
+39 tests already fail on the current code and were left out.
+```
+
+The three untested functions are a React table no test renders. The twelve it would not judge sit behind integration tests that need Postgres, which was not running, so Potemkin said so instead of guessing.
 
 ## Guard: send the agent back before you read its diff
 
@@ -106,10 +121,13 @@ Both are idempotent, keep your other hooks and settings, and write through a sym
 ## In CI
 
 ```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0   # Potemkin needs the branch point
 - run: npx potemkin-cli --base origin/main --strict
 ```
 
-`--base` checks only what changed since the branch left `main`; `--strict` exits 1 when any function is HOLLOW or UNTESTED. `--json` gives every verdict with its reason and tests.
+`--base` checks only what changed since the branch left `main`; `--strict` exits 1 when any function is HOLLOW or UNTESTED, or when nothing could be judged. `--json` gives every verdict with its reason and tests.
 
 ## Options
 

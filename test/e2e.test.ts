@@ -2,12 +2,19 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 
 const CLI = join(import.meta.dirname, '..', 'src', 'cli.ts');
+const made: string[] = [];
+after(() => made.forEach((d) => rmSync(d, { recursive: true, force: true })));
+const scratch = (prefix: string) => {
+  const d = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  made.push(d);
+  return d;
+};
 const MODULES = join(import.meta.dirname, '..', 'node_modules'); // vitest is a devDependency
 
 type Files = Record<string, string>;
@@ -20,7 +27,7 @@ const put = (dir: string, files: Files) => {
 
 /** A git repo with `base` committed, `edit` applied on top, and node_modules made of links into ours. */
 function repo(base: Files, edit: Files | ((dir: string) => void), extraModules: Record<string, string> = {}) {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'potemkin-e2e-')));
+  const dir = scratch('potemkin-e2e-');
   const sh = (...args: string[]) => assert.equal(spawnSync('git', args, { cwd: dir }).status, 0, args.join(' '));
   sh('init', '-q', '-b', 'main');
   sh('config', 'user.email', 't@example.com');
@@ -49,7 +56,7 @@ function fingerprint(dir: string) {
   return h.digest('hex');
 }
 
-const tmp = () => mkdtempSync(join(tmpdir(), 'potemkin-tmp-')); // the CLI's TMPDIR, to prove the sandbox is gone
+const tmp = () => scratch('potemkin-tmp-'); // the CLI's TMPDIR, to prove the sandbox is gone
 const cli = (cwd: string, args: string[], env: Record<string, string> = {}, input?: string) =>
   spawnSync(process.execPath, [CLI, ...args], { cwd, encoding: 'utf8', input, env: { ...process.env, NO_COLOR: '1', ...env } });
 const verdicts = (dir: string, args: string[] = []) => {
@@ -136,7 +143,29 @@ test('a comment-only edit, a deleted neighbour or a sibling on the same line is 
     { 'src/a.ts': `export function keep() {\n  return 1;\n}\n// new note\nexport function tail() {\n  return 3; // reformatted\n}\nexport const api = { ping: () => 'pong', double: (n: number) => n * 3 };\n` },
   );
   const out = JSON.parse(cli(dir, ['--json']).stdout);
-  assert.deepEqual(out.functions.map((f: any) => f.name), ['double']);
+  assert.deepEqual(out.functions.map((f: any) => f.name), ['api.double']);
+});
+
+test('moved files, renamed classes and reordered same-named functions are not changes; an emptied function is', () => {
+  const dir = repo(
+    {
+      'src/old.ts': 'export function slugify(s: string) {\n  return s.toLowerCase();\n}\nexport function legacyEscape(s: string) {\n  return s.replace(/&/g, "&amp;");\n}\n',
+      'src/shapes.ts': 'export class Shape {\n  area(r: number) {\n    return r * r;\n  }\n}\n',
+      'src/routes.ts': 'export const users = { create: (x: number) => x + 1 };\nexport const posts = { create: (x: number) => x + 2 };\n',
+      'src/clear.ts': 'export function clear(xs: number[]) {\n  xs.length = 0;\n  return xs;\n}\n',
+      'test/all.test.ts': "import { expect, test } from 'vitest';\nimport { clear } from '../src/clear';\ntest('clears', () => {\n  clear([1]);\n  expect(true).toBe(true);\n});\n",
+    },
+    (d) => {
+      spawnSync('mv', [join(d, 'src/old.ts'), join(d, 'src/strings.ts')]);
+      writeFileSync(join(d, 'src/shapes.ts'), 'export class Square {\n  area(r: number) {\n    return r * r;\n  }\n}\n');
+      writeFileSync(join(d, 'src/routes.ts'), 'export const comments = { create: (x: number) => x + 3 };\nexport const posts = { create: (x: number) => x + 2 };\nexport const users = { create: (x: number) => x + 1 };\n');
+      writeFileSync(join(d, 'src/clear.ts'), 'export function clear(xs: number[]) {}\n'); // the agent gutted it
+    },
+  );
+  const { v, out } = verdicts(dir);
+  assert.deepEqual(Object.keys(v).sort(), ['clear', 'comments.create']);
+  assert.equal(v.clear.verdict, 'HOLLOW'); // the test runs it and asserts nothing
+  assert.equal(out.survive, 2);
 });
 
 test('falls back to the last commit when nothing is uncommitted; --base diffs from the branch point', () => {
@@ -199,7 +228,7 @@ test('a related test that already fails turns accusations into UNVERIFIABLE', ()
   });
   const { v, out } = verdicts(dir);
   assert.equal(v.add.verdict, 'UNVERIFIABLE');
-  assert.match(v.add.why, /already fails before any change and might check it \(test\/math\.test\.ts › adds\)/);
+  assert.match(v.add.why, /already fails on the current code, before Potemkin changed anything \(test\/math\.test\.ts › adds\)/);
   assert.equal(out.testsExcluded, 1);
 });
 
@@ -228,7 +257,7 @@ test('monorepo: a workspace link resolves to the sandbox copy', () => {
 });
 
 test('symlinked source files are never written through; .env is copied, not linked', () => {
-  const outside = realpathSync(mkdtempSync(join(tmpdir(), 'potemkin-outside-')));
+  const outside = scratch('potemkin-outside-');
   writeFileSync(join(outside, 'real.ts'), 'export function add(a: number, b: number) {\n  return a + b;\n}\n');
   const dir = repo(
     { 'test/linked.test.ts': "import { expect, test } from 'vitest';\nimport { writeFileSync } from 'node:fs';\nimport { other } from '../src/other';\ntest('other', () => {\n  writeFileSync('.env', 'API_KEY=test');\n  expect(other()).toBe(1);\n});\n" },
@@ -241,8 +270,7 @@ test('symlinked source files are never written through; .env is copied, not link
   );
   const before = readFileSync(join(outside, 'real.ts'), 'utf8');
   const { v } = verdicts(dir);
-  assert.equal(v.add.verdict, 'UNVERIFIABLE');
-  assert.match(v.add.why, /symlink/);
+  assert.equal(v.add, undefined); // a symlink is not a file of this repo
   assert.equal(v.other.verdict, 'NOTICED');
   assert.equal(readFileSync(join(outside, 'real.ts'), 'utf8'), before);
   assert.equal(readFileSync(join(dir, '.env'), 'utf8'), 'API_KEY=real');
@@ -299,7 +327,7 @@ test('guard blocks on hollow tests once per diff, stands down on retry, and neve
 });
 
 test('install and uninstall are idempotent and leave everything else alone', () => {
-  const home = realpathSync(mkdtempSync(join(tmpdir(), 'potemkin-claude-')));
+  const home = scratch('potemkin-claude-');
   const dotfiles = join(home, 'dotfiles.json');
   const file = join(home, 'settings.json');
   const mine = { type: 'command', command: '~/bin/potemkin-village guard --strict' };

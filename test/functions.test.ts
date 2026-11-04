@@ -1,10 +1,12 @@
 // The mutator: finds the right functions, fingerprints them, and every mutant it writes still parses.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'node:test';
+import { after, test } from 'node:test';
+
+const TQ = '"'.repeat(3); // a Python docstring quote
 import { parse } from '@babel/parser';
 import { canary, jsFunctions, jsMutant, NOT_SOURCE, pyFunctions, pyMutant } from '../src/functions.ts';
 
@@ -35,7 +37,7 @@ const PLUGINS = ['typescript', 'decorators', 'decoratorAutoAccessors'] as const;
 test('finds named functions, skips constructors, overloads, abstract and ambient ones', () => {
   assert.deepEqual(
     jsFunctions('src/shape.ts', TS).map((f) => `${f.name}@${f.line}`),
-    ['Shape.area@6', 'Shape.get size@7', 'Shape.set size@8', 'Shape.make@10', 'Shape.#secret@11', 'over@14', 'default@16', 'pick@17', 'stream@18', 'get@19', 'post@19', 'del@19', 'module.exports.legacy@20', 'Row@21'],
+    ['Shape.area@6', 'Shape.get size@7', 'Shape.set size@8', 'Shape.make@10', 'Shape.#secret@11', 'over@14', 'default@16', 'pick@17', 'stream@18', 'api.get@19', 'api.post@19', 'api.del@19', 'module.exports.legacy@20', 'Row@21'],
   );
 });
 
@@ -78,9 +80,19 @@ class A { accessor y = 1; z = () => ({ a: 1 }); }
   assert.deepEqual(jsFunctions('b.tsx', src).map((f) => f.name), ['Row', 'h', 'Card', 'f', 'g', 'Foo.m', 'default.n', 'A.z']);
 });
 
-test('functions that already do nothing are skipped', () => {
+test('functions that already do nothing are flagged inert, and their EMPTY mutant is the code itself', () => {
   const src = `export function noop() {}\nexport const nothing = () => undefined;\nexport function bare() { return; }\nexport function assertNever(x: never): never { throw new Error('x'); }\nclass L { debug(_m: string): void {} }\nexport function real() { return 1; }\n`;
-  assert.deepEqual(jsFunctions('c.ts', src).map((f) => f.name), ['real']);
+  const fns = jsFunctions('c.ts', src);
+  assert.deepEqual(fns.map((f) => `${f.name}${f.inert ? '!' : ''}`), ['noop!', 'nothing!', 'bare!', 'assertNever!', 'L.debug!', 'real']);
+  assert.equal(jsMutant(src, fns[0], 'empty'), src);
+  assert.notEqual(jsMutant(src, fns[0], 'throw'), src);
+});
+
+test('nested functions are named by what encloses them, and siblings get #2', () => {
+  const src = `function outer() {\n  const inner = () => 1;\n  return inner();\n}\nconst api = { get() { return 1; }, nested: { get() { return 2; } } };\nexport const create = (x) => x;\nexport const create2 = { create: () => 1 };\n`;
+  assert.deepEqual(jsFunctions('a.ts', src).map((f) => f.name), ['outer', 'outer.inner', 'api.get', 'api.nested.get', 'create', 'create2.create']);
+  const dup = `router.get('/a', function handler() { return 1; });\nrouter.get('/b', function handler() { return 2; });\n`;
+  assert.deepEqual(jsFunctions('b.js', dup).map((f) => f.name), ['handler', 'handler#2']);
 });
 
 test('fingerprints ignore formatting and comments, and a nested edit only changes the nested function', () => {
@@ -90,8 +102,12 @@ test('fingerprints ignore formatting and comments, and a nested edit only change
   const c = fp(`export function outer(x) {\n  const inner = (y) => y * 3;\n  return inner(x) + 1;\n}\n`);
   assert.deepEqual(a, b);
   assert.equal(a.outer, c.outer);
-  assert.notEqual(a.inner, c.inner);
+  assert.notEqual(a['outer.inner'], c['outer.inner']);
   assert.notEqual(fp(`export function outer(x) { const inner = (y) => y * 2; return inner(x) + 2 }`).outer, a.outer);
+  // JSX: re-indenting, collapsing lines and {/* comments */} render the same
+  const j = (src: string) => jsFunctions('a.tsx', src)[0].fp;
+  assert.equal(j(`export const Card = () => <div className="c">\n  {/* title */}\n  Hello\n</div>;\n`), j(`export const Card = () => (\n  <div className="c">Hello</div>\n);\n`));
+  assert.notEqual(j(`export const Card = () => <div className="c">Hello</div>;`), j(`export const Card = () => <div className="c">Hi</div>;`));
 });
 
 test('line numbers count \\n only, as git does', () => {
@@ -128,8 +144,12 @@ test('tests, mocks, fixtures, stories, configs and type declarations are not sou
 });
 
 const python = spawnSync('python3', ['--version']).status === 0;
+const made: string[] = [];
+after(() => made.forEach((d) => rmSync(d, { recursive: true, force: true })));
 const pyFile = (name: string, text: string) => {
-  const file = join(mkdtempSync(join(tmpdir(), 'potemkin-py-')), name);
+  const dir = mkdtempSync(join(tmpdir(), 'potemkin-py-'));
+  made.push(dir);
+  const file = join(dir, name);
   writeFileSync(file, text);
   return file;
 };
@@ -178,7 +198,10 @@ def emoji(s="🎉✓"): return s + "✓"
 `,
   );
   const fns = pyFunctions('python3', 'repo.py', file);
-  assert.deepEqual(fns.map((f) => `${f.name}@${f.line}`), ['Repo.size@8', 'Repo.size.setter@13', 'Repo.make@17', 'Repo.fetch@20', 'Repo.gen@23', 'outer@33', 'outer.inner@34', 'emoji@38']);
+  assert.deepEqual(fns.map((f) => `${f.name}@${f.line}${f.inert ? '!' : ''}`), ['Repo.size@8', 'Repo.size.setter@13', 'Repo.make@17', 'Repo.fetch@20', 'Repo.gen@23', 'Repo.never@29!', 'outer@33', 'outer.inner@34', 'emoji@38']);
+  assert.equal(pyMutant('python3', file, fns.find((f) => f.name === 'Repo.never')!, 'empty'), readFileSync(file, 'utf8'));
+  const doc = (text: string) => pyFunctions('python3', 'x.py', '-', text)[0].fp; // a reworded docstring is not a change
+  assert.equal(doc('def f():\n    DOC_ONE\n    return 1\n'.replace('DOC_ONE', TQ + 'One.' + TQ)), doc('def f():\n    DOC_TWO\n    return 1\n'.replace('DOC_TWO', TQ + 'Two, reworded.' + TQ)));
   for (const fn of fns) for (const kind of ['empty', 'throw'] as const) pyMutant('python3', file, fn, kind, '/tmp/m'); // the script verifies every mutant
   const get = (n: string) => fns.find((f) => f.name === n)!;
   assert.match(pyMutant('python3', file, get('emoji'), 'empty'), /def emoji\(s="🎉✓"\): return None\n$/);

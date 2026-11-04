@@ -10,8 +10,9 @@ export interface Runner {
   dir: string; // repo-relative directory the runner starts in ('' is the root)
   exe: string; // repo-relative bin (vitest, jest) or a python interpreter
   major: number; // vitest/jest major version, 0 if unknown
-  nodeOptions?: string; // from the package's test script, e.g. --experimental-vm-modules for jest ESM
-  configs: string[]; // other runner configs in that directory, which Potemkin does not run
+  env: Record<string, string>; // from the package's test script: NODE_OPTIONS, TZ=UTC and the like
+  configs: string[]; // other test configs and suites in that directory, which Potemkin does not run
+  noCov?: boolean; // pytest-cov is installed: pass --no-cov so a coverage threshold cannot fail the run
 }
 
 export type Outcome = 'pass' | 'fail' | 'skip';
@@ -19,9 +20,10 @@ export type Results = Map<string, Outcome>; // test id -> outcome
 
 export interface Run {
   results: Results | null; // null: no readable results (crash, timeout, missing output)
+  messages: Map<string, string>; // failure text per failed test id, where the runner gives one
   code: number | null; // exit code, null on timeout
   timedOut: boolean;
-  tail: string; // last lines of the runner's output, for diagnostics
+  tail: string; // the runner's output, for diagnostics
 }
 
 /** Which tests to run: those the runner relates to these source files, these test files, or all. */
@@ -35,40 +37,79 @@ const readJson = (file: string) => {
     return undefined;
   }
 };
+const readText = (file: string) => {
+  try {
+    return readFileSync(file, 'utf8');
+  } catch {
+    return '';
+  }
+};
 const up = (d: string) => (d === '' || d === '.' ? undefined : dirname(d) === '.' ? '' : dirname(d));
+const VITEST_CONFIG = /^vitest\.(?:config|workspace|projects)\.[cm]?[jt]s$|^vite\.config\.[cm]?[jt]s$/;
+const JEST_CONFIG = /^jest\.config\.[cm]?[jt]s$|^jest\.config\.json$/;
 
 function jsRunner(root: string, file: string): Runner | string {
+  let found: { kind: 'vitest' | 'jest'; dir: string } | undefined;
   let depOnly: { kind: 'vitest' | 'jest'; dir: string } | undefined;
   for (let d: string | undefined = up(file) ?? ''; d !== undefined; d = up(d)) {
     const abs = join(root, d);
     const names = existsSync(abs) ? readdirSync(abs) : [];
     const pkg = names.includes('package.json') ? readJson(join(abs, 'package.json')) : undefined;
-    const has = (re: RegExp) => names.some((n) => re.test(n));
     // A config file decides. A dependency alone only counts if no folder above has a config.
-    const config = has(/^vitest\.(?:config|workspace|projects)\.[cm]?[jt]s$/) ? 'vitest' : has(/^jest\.config\./) || pkg?.jest ? 'jest' : undefined;
-    if (config) return make(root, config, d, names, pkg);
-    if (!depOnly && pkg) {
+    const config = names.some((n) => VITEST_CONFIG.test(n)) && (deps(pkg).vitest || findUp(root, d, join('node_modules', '.bin', 'vitest'))) ? 'vitest' : names.some((n) => JEST_CONFIG.test(n)) || pkg?.jest ? 'jest' : undefined;
+    if (config && !found) found = { kind: config, dir: d };
+    // An umbrella config above it (vitest projects/workspace, jest projects) runs every package's tests.
+    if (config && found && d !== found.dir && config === found.kind && umbrella(abs, names, pkg, config)) found = { kind: config, dir: d };
+    if (!found && !depOnly && pkg) {
       const kind = deps(pkg).vitest ? 'vitest' : deps(pkg).jest ? 'jest' : undefined;
       if (kind) depOnly = { kind, dir: d };
     }
   }
-  if (depOnly) {
-    const abs = join(root, depOnly.dir);
-    return make(root, depOnly.kind, depOnly.dir, readdirSync(abs), readJson(join(abs, 'package.json')));
+  const use = found ?? depOnly;
+  if (!use) return 'no vitest or jest setup found (Potemkin supports vitest, jest and pytest)';
+  const abs = join(root, use.dir);
+  return make(root, use.kind, use.dir, readdirSync(abs), readJson(join(abs, 'package.json')));
+}
+
+function umbrella(abs: string, names: string[], pkg: any, kind: 'vitest' | 'jest'): boolean {
+  if (kind === 'vitest') {
+    if (names.some((n) => /^vitest\.(?:workspace|projects)\./.test(n))) return true;
+    return names.filter((n) => VITEST_CONFIG.test(n)).some((n) => /\b(?:projects|workspace)\s*:/.test(readText(join(abs, n))));
   }
-  return 'no vitest or jest setup found (Potemkin supports vitest, jest and pytest)';
+  if (Array.isArray(pkg?.jest?.projects)) return true;
+  return names.filter((n) => JEST_CONFIG.test(n)).some((n) => /\bprojects\b/.test(readText(join(abs, n))));
 }
 
 function make(root: string, kind: 'vitest' | 'jest', dir: string, names: string[], pkg: any): Runner | string {
   const bin = findUp(root, dir, join('node_modules', '.bin', kind));
   if (!bin) return `${kind} is set up in ${dir || 'the repo root'}, but node_modules/.bin/${kind} is missing (install dependencies first)`;
   const ver = readJson(join(root, bin, '..', '..', kind, 'package.json'))?.version ?? '';
-  const script: string = pkg?.scripts?.test ?? '';
-  const nodeOptions = /\bNODE_OPTIONS=(?:"([^"]*)"|'([^']*)'|(\S+))/.exec(script)?.slice(1).find(Boolean);
-  const main = kind === 'vitest' ? /^vitest\.config\./ : /^jest\.config\./;
-  const other = kind === 'vitest' ? /^vite(?:st)?\.[\w-]+\.config\.[cm]?[jt]s$|^vitest\.[\w-]+\.[cm]?[jt]s$/ : /^jest\.[\w-]+\.config\./;
-  const configs = names.filter((n) => other.test(n) && !main.test(n) && !/^vitest\.(?:workspace|projects)\./.test(n));
-  return { kind, dir, exe: bin, major: Number(ver.split('.')[0]) || 0, nodeOptions, configs };
+  return { kind, dir, exe: bin, major: Number(ver.split('.')[0]) || 0, env: scriptEnv(pkg?.scripts?.test ?? '', kind), configs: otherConfigs(names, pkg, kind) };
+}
+
+// What the test script sets up that a bare run would miss: `TZ=UTC NODE_OPTIONS=--experimental-vm-modules jest`,
+// or `node --experimental-vm-modules node_modules/.bin/jest`.
+function scriptEnv(script: string, kind: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  const m = /^(?:\s*(?:cross-env\s+)?(?:[A-Z_][A-Z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s*))+/.exec(script);
+  for (const kv of (m?.[0] ?? '').matchAll(/([A-Z_][A-Z0-9_]*)=("[^"]*"|'[^']*'|\S*)/g)) {
+    if (['PATH', 'HOME', 'CI'].includes(kv[1])) continue;
+    env[kv[1]] = kv[2].replace(/^["']|["']$/g, '').replace(/\$\{?NODE_OPTIONS\}?/g, '').trim();
+  }
+  const flags = new RegExp(`\\bnode\\s+((?:--?[\\w-]+(?:=\\S+)?\\s+)+)\\S*${kind}`).exec(script);
+  if (flags) env.NODE_OPTIONS = [env.NODE_OPTIONS, flags[1].trim()].filter(Boolean).join(' ');
+  return env;
+}
+
+// Other configs and suites in this directory: Potemkin runs the default one and names the rest.
+function otherConfigs(names: string[], pkg: any, kind: 'vitest' | 'jest'): string[] {
+  const main = kind === 'vitest' ? VITEST_CONFIG : JEST_CONFIG;
+  const out = new Set<string>();
+  for (const n of names)
+    if (!main.test(n) && /^(?:vitest|jest)\.config\.[\w-]+\.[\w]+$|^(?:playwright|cypress)\.config\.[cm]?[jt]s$|^wdio\.conf(?:ig)?\.[cm]?[jt]s$/.test(n)) out.add(n);
+  for (const script of Object.values(pkg?.scripts ?? {}) as string[])
+    for (const m of script.matchAll(/(?:--config|-c)[=\s]+([^\s'"&;|]+)/g)) if (!main.test(m[1].split('/').at(-1)!)) out.add(m[1]);
+  return [...out];
 }
 
 function findUp(root: string, dir: string, rel: string): string | undefined {
@@ -91,12 +132,24 @@ export function pythonFor(root: string, file = ''): string {
   return 'python3';
 }
 
-const pytestOk = new Map<string, boolean>();
+const probes = new Map<string, { pytest: boolean; cov: boolean }>();
 export function runnerFor(root: string, file: string): Runner | string {
   if (!file.endsWith('.py')) return jsRunner(root, file);
   const python = pythonFor(root, file);
-  if (!pytestOk.has(python)) pytestOk.set(python, spawnSync(python, ['-m', 'pytest', '--version'], { stdio: 'ignore', cwd: tmpdir() }).status === 0);
-  return pytestOk.get(python) ? { kind: 'pytest', dir: '', exe: python, major: 0, configs: [] } : `pytest is not installed for ${python}`;
+  if (!probes.has(python)) {
+    const ok = (code: string) => spawnSync(python, ['-I', '-c', code], { stdio: 'ignore', cwd: tmpdir() }).status === 0;
+    probes.set(python, { pytest: ok('import pytest'), cov: ok('import pytest_cov') });
+  }
+  const p = probes.get(python)!;
+  if (!p.pytest) return `pytest is not installed for ${python}`;
+  // pytest reads its config from the nearest ini-style file above the tests, so start there.
+  let dir = '';
+  for (let d: string | undefined = up(file) ?? ''; d !== undefined; d = up(d))
+    if (['pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini'].some((n) => existsSync(join(root, d!, n)))) {
+      dir = d;
+      break;
+    }
+  return { kind: 'pytest', dir, exe: python, major: 0, env: {}, configs: [], noCov: p.cov };
 }
 
 // Python has no import graph to ask, so related tests are the test files that name the module.
@@ -117,7 +170,7 @@ export const stopCurrent = () => {
   }
 };
 
-export function command(r: Runner, sandbox: string, sel: Selection, out: string): string[] {
+export function command(r: Runner, sandbox: string, work: string, sel: Selection, out: string): string[] {
   const abs = (fs: string[]) => fs.map((f) => join(sandbox, f));
   if (r.kind === 'vitest') {
     const pick = sel === 'all' ? ['run'] : 'related' in sel ? ['related', ...abs(sel.related), '--run'] : ['run', ...abs(sel.files)];
@@ -127,31 +180,36 @@ export function command(r: Runner, sandbox: string, sel: Selection, out: string)
   }
   if (r.kind === 'jest') {
     const pick = sel === 'all' ? [] : 'related' in sel ? ['--findRelatedTests', ...abs(sel.related)] : ['--runTestsByPath', ...abs(sel.files)];
-    return [join(sandbox, r.exe), ...pick, '--json', `--outputFile=${out}`, '--passWithNoTests', '--coverage=false', '--no-watchman'];
+    return [join(sandbox, r.exe), ...pick, '--json', `--outputFile=${out}`, '--passWithNoTests', '--ci', '--coverage=false', '--no-watchman', '--forceExit', `--cacheDirectory=${join(work, 'jest-cache')}`];
   }
   const pick = sel === 'all' ? [] : 'related' in sel ? abs(sel.related) : abs(sel.files);
-  return [r.exe, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', `--junitxml=${out}`, ...pick];
+  return [r.exe, '-m', 'pytest', '-q', '-o', `cache_dir=${join(work, 'pytest-cache')}`, '-o', 'junit_family=xunit1', `--junitxml=${out}`, ...(r.noCov ? ['--no-cov'] : []), ...pick];
 }
 
-export async function runTests(r: Runner, sandbox: string, sel: Selection, timeoutMs: number, out: string): Promise<Run> {
+export async function runTests(r: Runner, sandbox: string, work: string, sel: Selection, timeoutMs: number): Promise<Run> {
+  const out = join(work, r.kind === 'pytest' ? 'results.xml' : 'results.json');
   rmSync(out, { force: true });
-  const [exe, ...args] = command(r, sandbox, sel, out);
-  // Temp files go inside the sandbox too, so a killed runner cannot litter the real temp directory.
-  const temp = join(sandbox, '.potemkin', 'tmp');
+  // Every run gets a fresh temp directory, so state a test leaves in os.tmpdir() cannot carry over.
+  const temp = join(work, 'tmp');
+  rmSync(temp, { recursive: true, force: true });
   mkdirSync(temp, { recursive: true });
-  const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: '1', TMPDIR: temp, TMP: temp, TEMP: temp };
+  const [exe, ...args] = command(r, sandbox, work, sel, out);
+  const env: NodeJS.ProcessEnv = { ...process.env, ...r.env, NO_COLOR: '1', TMPDIR: temp, TMP: temp, TEMP: temp };
   delete env.FORCE_COLOR; // Node warns when both are set
-  if (r.nodeOptions) env.NODE_OPTIONS = [process.env.NODE_OPTIONS, r.nodeOptions].filter(Boolean).join(' ');
+  if (r.env.NODE_OPTIONS) env.NODE_OPTIONS = [process.env.NODE_OPTIONS, r.env.NODE_OPTIONS].filter(Boolean).join(' ');
   if (r.kind === 'pytest') {
     // Sandbox first, so an editable install of the original checkout cannot shadow the mutant,
     // and no bytecode cache, so a stale .pyc cannot either.
-    env.PYTHONPATH = [sandbox, join(sandbox, 'src'), process.env.PYTHONPATH].filter(Boolean).join(':');
+    const here = join(sandbox, r.dir);
+    env.PYTHONPATH = [...new Set([here, join(here, 'src'), sandbox, join(sandbox, 'src')]), process.env.PYTHONPATH].filter(Boolean).join(':');
     env.PYTHONDONTWRITEBYTECODE = '1';
   }
-  const tail: string[] = [];
+  const chunks: string[] = [];
+  let size = 0;
   const keep = (d: Buffer) => {
-    tail.push(d.toString());
-    while (tail.join('').length > 8000) tail.shift();
+    chunks.push(d.toString());
+    size += d.length;
+    while (size > 16000 && chunks.length > 1) size -= chunks.shift()!.length;
   };
   const { code, timedOut } = await new Promise<{ code: number | null; timedOut: boolean }>((done) => {
     const child = spawn(exe, args, { cwd: join(sandbox, r.dir), env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
@@ -173,16 +231,17 @@ export async function runTests(r: Runner, sandbox: string, sel: Selection, timeo
     });
   });
   current = undefined;
-  const text = tail.join('').trim();
+  const text = chunks.join('').trim();
   let results: Results | null = null;
+  const messages = new Map<string, string>();
   if (!timedOut && existsSync(out)) {
     try {
-      results = r.kind === 'pytest' ? junit(readFileSync(out, 'utf8')) : jestJson(readFileSync(out, 'utf8'), sandbox);
+      results = r.kind === 'pytest' ? junit(readFileSync(out, 'utf8'), messages) : jestJson(readFileSync(out, 'utf8'), sandbox, messages);
     } catch {}
   }
   // Exited non-zero but no test failed (globalSetup threw, unhandled error, ESM loader…): unreadable.
   if (results && code !== 0 && ![...results.values()].includes('fail') && !(r.kind === 'pytest' && code === 5)) results = null;
-  return { results, code, timedOut, tail: text.slice(-1500) };
+  return { results, messages, code, timedOut, tail: text };
 }
 
 const RANK: Record<Outcome, number> = { pass: 0, skip: 1, fail: 2 };
@@ -193,7 +252,7 @@ const set = (m: Results, id: string, o: Outcome) => {
 const SKIPPED = new Set(['skipped', 'pending', 'todo', 'disabled']);
 
 // vitest's json reporter writes jest's format.
-function jestJson(text: string, sandbox: string): Results {
+function jestJson(text: string, sandbox: string, messages: Map<string, string>): Results {
   const m: Results = new Map();
   for (const f of JSON.parse(text).testResults ?? []) {
     const file = relative(sandbox, f.name);
@@ -202,24 +261,34 @@ function jestJson(text: string, sandbox: string): Results {
     const setup = f.status === 'failed' && !tests.some((a: any) => a.status === 'failed');
     for (const a of tests) {
       const o: Outcome = a.status === 'passed' ? 'pass' : SKIPPED.has(a.status) ? (setup ? 'fail' : 'skip') : 'fail';
-      set(m, `${file} › ${a.fullName ?? [...(a.ancestorTitles ?? []), a.title].join(' ')}`, o);
+      const id = `${file} › ${a.fullName ?? [...(a.ancestorTitles ?? []), a.title].join(' ')}`;
+      set(m, id, o);
+      if (o === 'fail') messages.set(id, [...(a.failureMessages ?? []), setup ? f.message ?? '' : ''].join('\n'));
     }
-    if (setup) set(m, `${file} › (the file failed to load or set up)`, 'fail');
+    if (setup) {
+      const id = `${file} › (the file failed to load or set up)`;
+      set(m, id, 'fail');
+      messages.set(id, f.message ?? '');
+    }
   }
   return m;
 }
 
 const unxml = (s: string) => s.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 
-function junit(xml: string): Results {
+// pytest junit (xunit1): ids start with the test file, like vitest's and jest's, so testFile() works for all three.
+function junit(xml: string, messages: Map<string, string>): Results {
   const m: Results = new Map();
   for (const t of xml.matchAll(/<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g)) {
     const attr = (k: string) => unxml(new RegExp(`\\b${k}="([^"]*)"`).exec(t[1])?.[1] ?? '');
     const body = t[2] ?? '';
-    set(m, `${attr('classname')} › ${attr('name')}`, /<(?:failure|error)\b/.test(body) ? 'fail' : /<skipped\b/.test(body) ? 'skip' : 'pass');
+    const id = `${attr('file')} › ${attr('classname')}::${attr('name')}`;
+    const o: Outcome = /<(?:failure|error)\b/.test(body) ? 'fail' : /<skipped\b/.test(body) ? 'skip' : 'pass';
+    set(m, id, o);
+    if (o === 'fail') messages.set(id, unxml(body));
   }
   return m;
 }
 
-/** The repo-relative test file a result id belongs to (vitest and jest ids start with it). */
+/** The repo-relative test file a result id belongs to ('' for a collection error that has none). */
 export const testFile = (id: string) => id.split(' › ')[0];

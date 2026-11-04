@@ -64,9 +64,11 @@ export function facade(hollow: boolean) {
   );
 }
 
-// JetBrains Mono at 22px: about 46 characters fit the column. Shorten the name, keep the reason.
-const fit = (name: string, why: string, width = 46) => {
+// JetBrains Mono at 22px: about 45 characters fit the column. Shorten the name, keep the reason,
+// and for a long Class.method keep the method.
+const fit = (name: string, why: string, width = 45) => {
   const room = Math.max(8, width - why.length - 3);
+  if (name.length > room && name.includes('.')) name = name.slice(name.lastIndexOf('.') + 1);
   return `${name.length > room ? `${name.slice(0, room - 1)}…` : name} · ${why}`;
 };
 
@@ -76,7 +78,7 @@ export async function renderCard(d: CardData): Promise<Buffer> {
   const headline = hollow
     ? d.total === 1
       ? `The function your agent changed could be gutted, and every test would still pass.${also}`
-      : `${d.survive} of ${d.total} functions your agent changed could be gutted, and every test would still pass.${also}`
+      : `${d.survive === d.total ? 'All' : `${d.survive} of`} ${d.total} functions your agent changed could be gutted, and every test would still pass.${also}`
     : d.total === 1
       ? `The function your agent changed is pinned: gut it and a test turns red.${also}`
       : `All ${d.total} functions your agent changed are pinned: gut one and a test turns red.${also}`;
@@ -93,8 +95,8 @@ export async function renderCard(d: CardData): Promise<Buffer> {
     div(
       { alignItems: 'center', justifyContent: 'space-between' },
       div(
-        { flexDirection: 'column', width: 680, minWidth: 0, flexShrink: 1 },
-        div({ fontSize: headline.length < 70 ? 50 : headline.length < 100 ? 44 : 38, fontWeight: 800, lineHeight: 1.12, letterSpacing: -1 }, headline),
+        { flexDirection: 'column', width: 680, minWidth: 0, flexShrink: 1, marginRight: 40 },
+        div({ fontSize: headline.length < 70 ? 50 : headline.length < 100 ? 44 : 38, fontWeight: 800, lineHeight: 1.12, letterSpacing: -1, textWrap: 'balance' }, headline),
         div({ flexDirection: 'column', marginTop: 24 }, ...lines),
       ),
       facade(hollow),

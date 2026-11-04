@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { parseArgs, styleText } from 'node:util';
 import type { CardData } from './card.ts';
@@ -53,14 +52,15 @@ const unchecked = (r: Report) => count(r, 'UNVERIFIABLE') + r.skipped.length;
 const label = (r: Report) => (/^[0-9a-f]{40,64}$/.test(r.label) ? r.label.slice(0, 12) : r.label);
 const time = (ms: number) => {
   const s = Math.round(ms / 1000);
-  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+  return s < 1 ? '<1s' : s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
 };
 const where = (c: { file: string; line: number }) => `${c.file}:${c.line}`;
 
 function headline(r: Report): string {
   const n = judged(r);
+  const every = r.configs.length ? 'every test Potemkin ran' : 'every test';
   if (!n) return 'Nothing could be judged.';
-  if (survive(r)) return n === 1 ? 'The changed function could be gutted, and every test would still pass.' : `${survive(r)} of ${n} functions could be gutted, and every test would still pass.`;
+  if (survive(r)) return n === 1 ? `The changed function could be gutted, and ${every} would still pass.` : `${survive(r) === n ? 'All' : survive(r) + ' of'} ${n} functions could be gutted, and ${every} would still pass.`;
   return n === 1 ? 'The changed function is pinned: gut it and a test turns red.' : `All ${n} functions are pinned: gut any of them and a test turns red.`;
 }
 
@@ -85,8 +85,8 @@ function render(r: Report, card?: string): string {
   lines.push('', out('bold', headline(r)));
   const notes: string[] = [];
   if (unchecked(r) && judged(r)) notes.push(`${plural(unchecked(r), 'more function')} could not be checked (below).`);
-  if (r.excluded) notes.push(`${plural(r.excluded, 'test')} already failed before any change and ${r.excluded === 1 ? 'was' : 'were'} left out.`);
-  if (r.configs.length) notes.push(`Not run: ${r.configs.join(', ')} (other test configs).`);
+  if (r.excluded) notes.push(`${plural(r.excluded, 'test')} already ${r.excluded === 1 ? 'fails' : 'fail'} on the current code and ${r.excluded === 1 ? 'was' : 'were'} left out.`);
+  if (r.configs.length) notes.push(`Not run: ${r.configs.join(', ')} (other test configs or suites).`);
   for (const n of notes) lines.push(out('dim', n));
 
   const section = (title: string, v: Verdict, detail: (c: Checked) => string[]) => {
@@ -110,7 +110,7 @@ function render(r: Report, card?: string): string {
     if (unv.size > 10) lines.push(out('dim', `  …and ${unv.size - 10} more (--json lists all)`));
   }
   if (r.skipped.length) {
-    const why = [...new Set(r.skipped.map((s) => s.why))];
+    const why = [...new Set(r.skipped.map((s) => (s.name === '(whole file)' ? `${s.file} ${s.why}` : s.why)))];
     const raise = why.some((w) => w.startsWith('over --max')) ? ' Raise --max to include them.' : '';
     lines.push('', `Not checked: ${plural(r.skipped.length, 'function')} (${why.slice(0, 3).join('; ')}).${raise}`);
   }
@@ -124,15 +124,16 @@ function card(r: Report): CardData {
     .sort((a, b) => b.tests.length - a.tests.length)
     .map((c) => ({
       name: c.name,
-      why: c.verdict === 'UNTESTED' ? 'no test calls it' : c.tests.length ? `${plural(c.tests.length, 'test runs', 'tests run')} it, still green` : 'tests run it, still green',
+      why: c.verdict === 'UNTESTED' ? 'no test calls it' : c.tests.length ? `${plural(c.tests.length, 'test')}, still green` : 'tests run it, still green',
     }));
-  const extra = [unchecked(r) ? `${unchecked(r)} not checked` : '', r.excluded ? `${plural(r.excluded, 'failing test')} left out` : ''].filter(Boolean);
+  const extra = [unchecked(r) ? `${unchecked(r)} not checked` : '', r.excluded ? `${plural(r.excluded, 'failing test')} left out` : '', r.configs.length ? `not run: ${r.configs.join(', ')}` : ''].filter(Boolean);
+  const folder = basename(r.root).length > 28 ? `${basename(r.root).slice(0, 27)}…` : basename(r.root);
   return {
     survive: survive(r),
     total: judged(r),
     unchecked: unchecked(r),
     worst,
-    meta: `${basename(r.root)} · changes since ${label(r)} · ${r.runners.join(', ')}`,
+    meta: `${folder} · changes since ${label(r)} · ${r.runners.join(', ')}`,
     stats: [`${count(r, 'NOTICED')} noticed · ${count(r, 'HOLLOW')} hollow · ${count(r, 'UNTESTED')} untested`, ...extra].join(' · '),
   };
 }
@@ -177,11 +178,11 @@ async function guard(max: number, timeoutMs: number) {
   if (typeof input !== 'object' || !input || Array.isArray(input) || input.stop_hook_active) return;
   const cwd = typeof input.cwd === 'string' ? input.cwd : process.cwd();
   // Same uncommitted diff as last time: nothing new to check, and no reason to block again.
+  // The memo lives in the repo's .git directory, which nobody else can plant a file in.
   const d = digest(cwd);
-  const memo = join(tmpdir(), `potemkin-guard-${createHash('sha256').update(d.root).digest('hex').slice(0, 16)}`);
-  if (existsSync(memo) && readFileSync(memo, 'utf8') === d.hash) return;
+  if (existsSync(d.memo) && readFileSync(d.memo, 'utf8') === d.hash) return;
   const r = await check({ cwd, max, timeoutMs, deadline: Date.now() + 200_000, noFallback: true });
-  writeFileSync(memo, d.hash);
+  writeFileSync(d.memo, d.hash);
   const hollow = r.functions.filter((c) => c.verdict === 'HOLLOW');
   if (!hollow.length) return;
   const reason = [
@@ -204,7 +205,18 @@ const exact = (_k: string, v: unknown, ctx?: { source?: string }) =>
 
 function install(remove: boolean) {
   const file = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'settings.json');
-  const real = existsSync(file) ? realpathSync(file) : file; // write through a dotfiles symlink, do not replace it
+  // Write through a dotfiles symlink (even a dangling one), never replace it.
+  let real = file;
+  for (let i = 0; i < 8; i++) {
+    let st;
+    try {
+      st = lstatSync(real);
+    } catch {
+      break;
+    }
+    if (!st.isSymbolicLink()) break;
+    real = resolve(dirname(real), readlinkSync(real));
+  }
   const text = existsSync(real) ? readFileSync(real, 'utf8') : '';
   let s: any;
   try {
@@ -277,7 +289,7 @@ async function main(argv: string[]) {
     parsed = parseArgs({ args: command ? argv.slice(1) : argv, options, allowPositionals: false });
   } catch (e) {
     if (command === 'guard') return; // a broken hook must never trap the agent
-    throw new UsageError(`${(e as Error).message.split('\n')[0]}. See --help.`);
+    throw new UsageError(`${(e as Error).message.split('\n')[0].replace(/\.$/, '')}. See --help.`);
   }
   const opt = parsed.values;
   if (opt.help) return console.log(HELP);
@@ -285,14 +297,14 @@ async function main(argv: string[]) {
   const max = opt.max === undefined ? (command === 'guard' ? 10 : 40) : Number(opt.max);
   const timeout = opt.timeout === undefined ? 120 : Number(opt.timeout);
   if (command === 'guard') {
-    if (!(Number.isInteger(max) && max > 0) || !(timeout > 0 && timeout <= 3600)) return;
+    if (!(Number.isInteger(max) && max > 0) || !(timeout >= 1 && timeout <= 3600)) return;
     try {
       await guard(max, timeout * 1000);
     } catch {} // a broken hook must never trap the agent
     return;
   }
   if (!(Number.isInteger(max) && max > 0)) throw new UsageError(`--max must be a whole number above 0 (got "${opt.max}")`);
-  if (!(timeout > 0 && timeout <= 3600)) throw new UsageError(`--timeout must be a number of seconds between 1 and 3600 (got "${opt.timeout}")`);
+  if (!(timeout >= 1 && timeout <= 3600)) throw new UsageError(`--timeout must be a number of seconds between 1 and 3600 (got "${opt.timeout}")`);
   if (command) return install(command === 'uninstall');
 
   // On a terminal, progress is one line that rewrites itself; in a log file, one line per step.
@@ -323,7 +335,7 @@ async function main(argv: string[]) {
   }
   console.log(opt.json ? json(r, file) : render(r, file));
   if (cardNote) console.error(cardNote);
-  if (opt.strict && survive(r)) process.exitCode = 1;
+  if (opt.strict && (survive(r) || (!judged(r) && r.functions.length))) process.exitCode = 1; // hollow, untested, or nothing Potemkin could vouch for
 }
 
 try {

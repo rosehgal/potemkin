@@ -14,6 +14,7 @@ export interface Fn {
   end: number; // last line
   lang: 'js' | 'py';
   fp: string; // structure of the function, without positions, comments or nested functions
+  inert: boolean; // already does nothing, or only throws: the EMPTY mutant is the code itself
   body?: { start: number; end: number; expr: boolean; setter: boolean; keep: number }; // js: span to replace; keep = directive prefix
   index?: number; // py: position in the Python script's list
 }
@@ -94,68 +95,76 @@ export function jsFunctions(file: string, src: string): Fn[] {
   };
   const found: { name: string; outer: any; fn: any }[] = [];
   const claimed = new Set<any>();
-  const add = (name: string, outer: any, fn: any) => {
+  const scopes = new Map<any, string>(); // a function or class node -> its qualified name, for what sits inside it
+  // Names are qualified by what encloses them: Cart.total, api.get, outer.inner. Siblings with the
+  // same name are matched by structure, so reordering them never counts as a change.
+  const add = (name: string, outer: any, fn: any, scope: string) => {
     if (!fn || claimed.has(fn)) return;
     claimed.add(fn);
-    if (fn.body?.start != null) found.push({ name, outer, fn });
+    const full = scope ? `${scope}.${name}` : name;
+    scopes.set(fn, full);
+    if (fn.body?.start != null) found.push({ name: full, outer, fn });
   };
   // Iterative walk: deep expression chains must not overflow the stack.
-  const stack: [any, string][] = [[ast.program, 'class']];
+  const stack: [any, string][] = [[ast.program, '']];
   while (stack.length) {
-    const [n, outerCls] = stack.pop()!;
+    const [n, outerScope] = stack.pop()!;
     if (!n || typeof n !== 'object') continue;
     if (Array.isArray(n)) {
-      for (let i = n.length - 1; i >= 0; i--) stack.push([n[i], outerCls]);
+      for (let i = n.length - 1; i >= 0; i--) stack.push([n[i], outerScope]);
       continue;
     }
     if (typeof n.type !== 'string') continue;
-    let cls = outerCls;
+    let scope = outerScope;
+    const kind = (k: string) => (k === 'get' || k === 'set' ? `${k} ` : '');
     switch (n.type) {
       case 'ClassDeclaration':
-        cls = n.id?.name ?? 'default';
-        break;
       case 'ClassExpression':
-        cls = n.id?.name ?? (n as any).__name ?? 'class';
+        scope = n.id?.name ?? n.__name ?? (n.type === 'ClassDeclaration' ? 'default' : 'class');
         break;
       case 'FunctionDeclaration':
-        add(n.id?.name ?? 'default', n, n);
+        add(n.id?.name ?? 'default', n, n, outerScope);
         break;
       case 'ClassMethod':
       case 'ClassPrivateMethod':
-        if (n.kind !== 'constructor') add(`${cls}.${n.kind === 'get' || n.kind === 'set' ? `${n.kind} ` : ''}${keyName(n.key, src)}`, n, n);
+        if (n.kind !== 'constructor') add(`${kind(n.kind)}${keyName(n.key, src)}`, n, n, outerScope);
         break;
       case 'ObjectMethod':
-        add(`${n.kind === 'get' || n.kind === 'set' ? `${n.kind} ` : ''}${keyName(n.key, src)}`, n, n);
+        add(`${kind(n.kind)}${keyName(n.key, src)}`, n, n, outerScope);
         break;
       case 'ClassProperty':
       case 'ClassPrivateProperty':
       case 'ClassAccessorProperty':
-        add(`${cls}.${keyName(n.key, src)}`, n, fnIn(n.value));
-        break;
       case 'ObjectProperty':
-        add(keyName(n.key, src), n, fnIn(n.value));
+        if (unwrap(n.value)?.type === 'ObjectExpression') unwrap(n.value).__name = keyName(n.key, src); // api.nested.get
+        else add(keyName(n.key, src), n, fnIn(n.value), outerScope);
         break;
       case 'VariableDeclarator':
         if (n.id?.type === 'Identifier') {
-          if (unwrap(n.init)?.type === 'ClassExpression') unwrap(n.init).__name = n.id.name;
-          else add(n.id.name, n, fnIn(n.init));
+          const init = unwrap(n.init);
+          if (init?.type === 'ClassExpression' || init?.type === 'ObjectExpression') init.__name = n.id.name;
+          else add(n.id.name, n, fnIn(n.init), outerScope);
         }
         break;
       case 'AssignmentExpression':
-        add(src.slice(n.left.start, n.left.end), n, fnIn(n.right));
+        add(src.slice(n.left.start, n.left.end), n, fnIn(n.right), outerScope);
         break;
       case 'ExportDefaultDeclaration':
-        add('default', n, fnIn(n.declaration));
+        add('default', n, fnIn(n.declaration), outerScope);
         break;
       case 'TSExportAssignment':
-        add('export=', n, fnIn(n.expression));
+        add('export=', n, fnIn(n.expression), outerScope);
         break;
       case 'FunctionExpression':
-        if (n.id) add(n.id.name, n, n); // memo(function Row() {…})
+        if (n.id) add(n.id.name, n, n, outerScope); // memo(function Row() {…})
+        break;
+      case 'ObjectExpression':
+        if (n.__name) scope = outerScope ? `${outerScope}.${n.__name}` : n.__name;
         break;
     }
+    if (scopes.has(n)) scope = scopes.get(n)!; // inside a named function: outer.inner
     const kids: [any, string][] = [];
-    for (const k in n) if (!SKIP_KEYS.has(k) && k !== '__name') kids.push([n[k], cls]);
+    for (const k in n) if (!SKIP_KEYS.has(k) && k !== '__name') kids.push([n[k], scope]);
     for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
   }
 
@@ -164,7 +173,6 @@ export function jsFunctions(file: string, src: string): Fn[] {
   for (const { name, outer, fn } of found.sort((a, b) => a.outer.start - b.outer.start)) {
     const n = (seen.get(name) ?? 0) + 1;
     seen.set(name, n);
-    if (inert(fn.body)) continue;
     const expr = fn.body.type !== 'BlockStatement';
     const directives = expr ? [] : (fn.body.directives ?? []);
     out.push({
@@ -174,6 +182,7 @@ export function jsFunctions(file: string, src: string): Fn[] {
       end: lineAt(outer.end - 1),
       lang: 'js',
       fp: fingerprint(outer, fn, claimed, src),
+      inert: inert(fn.body),
       body: { start: fn.body.start, end: fn.body.end, expr, setter: fn.kind === 'set', keep: directives.length ? directives.at(-1).end : fn.body.start + 1 },
     });
   }
@@ -183,8 +192,17 @@ export function jsFunctions(file: string, src: string): Fn[] {
 // Structural fingerprint: positions, comments, quotes and formatting are ignored, and nested
 // named functions are placeholders, so an edit counts only against the function it is in.
 function fingerprint(outer: any, self: any, fns: Set<any>, src: string): string {
+  const jsxText = (t: string) => t.split('\n').map((l) => l.trim()).filter(Boolean).join(' '); // what React renders
   try {
-    return JSON.stringify(outer, (k, v) => (SKIP_KEYS.has(k) || k === '__name' ? undefined : v && typeof v === 'object' && v !== self && fns.has(v) ? 'fn' : v));
+    const noise = (x: any) => (x?.type === 'JSXText' && !jsxText(x.value)) || (x?.type === 'JSXExpressionContainer' && x.expression?.type === 'JSXEmptyExpression'); // whitespace, {/* comment */}
+    return JSON.stringify(outer, (k, v) => {
+      if (SKIP_KEYS.has(k) || k === '__name') return undefined;
+      if (!v || typeof v !== 'object') return v;
+      if (Array.isArray(v)) return v.filter((x) => !noise(x));
+      if (v !== self && fns.has(v)) return 'fn';
+      if (v.type === 'JSXText') return { type: 'JSXText', value: jsxText(v.value) };
+      return v;
+    });
   } catch {
     return src.slice(outer.start, outer.end); // too deep to stringify: fall back to the text
   }
@@ -195,6 +213,7 @@ const THROW = 'throw new Error("potemkin: function gutted");';
 const mark = (marker?: string) => (marker ? `try { globalThis.process?.getBuiltinModule?.("node:fs")?.appendFileSync(${JSON.stringify(marker)}, "1"); } catch {} ` : '');
 
 export function jsMutant(src: string, fn: Fn, kind: Mutant, marker?: string): string {
+  if (fn.inert && kind === 'empty') return src; // it already does nothing: the baseline is the gutted run
   const b = fn.body!;
   // In TS, `as any` keeps the inferred return type, so typed callers in tests still compile (ts-jest typechecks).
   const any = TS_FILE.test(fn.file) ? ' as any' : '';
@@ -210,10 +229,14 @@ export function jsMutant(src: string, fn: Fn, kind: Mutant, marker?: string): st
 // A throw at the top of the file. If tests that import the file still pass,
 // they are not loading the sandbox copy.
 // (Above a `from __future__` import it is a SyntaxError instead, which fails the import just the same.)
-export function canary(file: string, src: string): string {
+// It leaves a mark first, so a load that some fallback swallows still shows up.
+export function canary(file: string, src: string, marker?: string): string {
   const eol = src.includes('\r\n') ? '\r\n' : '\n';
-  if (PY_FILE.test(file)) return `raise Exception("potemkin canary")${eol}${src}`;
-  return nocheck(file, afterShebang(src, `throw new Error("potemkin canary");${eol}`));
+  if (PY_FILE.test(file)) {
+    const note = marker ? `__import__("builtins").open(${JSON.stringify(marker)}, "a").write("1")${eol}` : '';
+    return `${note}raise Exception("potemkin canary")${eol}${src}`;
+  }
+  return nocheck(file, afterShebang(src, `${mark(marker)}throw new Error("potemkin canary");${eol}`));
 }
 
 function afterShebang(src: string, text: string): string {
@@ -240,7 +263,7 @@ def is_stub(fn):
     return all(isinstance(s, ast.Pass) or (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)) for s in fn.body)
 
 def only_raises(fn):
-    body = fn.body[1:] if is_docstring(fn.body[0]) else fn.body
+    body = fn.body[1:] if len(fn.body) > 1 and is_docstring(fn.body[0]) else fn.body
     return len(body) == 1 and isinstance(body[0], ast.Raise)
 
 def is_docstring(s):
@@ -263,7 +286,7 @@ def collect(tree):
                 names = deco_names(child)
                 suffix = ".setter" if "setter" in names else ".deleter" if "deleter" in names else ""
                 name = prefix + child.name + suffix
-                skip = child.name == "__init__" or is_stub(child) or only_raises(child) or "abstractmethod" in names or "overload" in names
+                skip = child.name == "__init__" or "abstractmethod" in names or "overload" in names
                 fns.append((name, child, skip))
                 stack.append((child, name + "."))
             elif isinstance(child, ast.ClassDef):
@@ -284,6 +307,8 @@ class Strip(ast.NodeTransformer):
 
 def fingerprint(fn):
     c = copy.deepcopy(fn)
+    if len(c.body) > 1 and is_docstring(c.body[0]):
+        c.body = c.body[1:]  # a reworded docstring is not a code change
     return hashlib.sha1(ast.dump(Strip(c).visit(c)).encode()).hexdigest()
 
 def is_generator(fn):
@@ -305,11 +330,14 @@ if mode == "list":
         if skip:
             continue
         start = min([fn.lineno] + [d.lineno for d in fn.decorator_list])
-        out.append({"name": name if seen[name] == 1 else name + "#" + str(seen[name]), "line": start, "end": fn.end_lineno, "index": index, "fp": fingerprint(fn)})
+        out.append({"name": name if seen[name] == 1 else name + "#" + str(seen[name]), "line": start, "end": fn.end_lineno, "index": index, "fp": fingerprint(fn), "inert": is_stub(fn) or only_raises(fn)})
     sys.stdout.write(json.dumps(out))
 else:
     idx, kind, marker = int(sys.argv[3]), sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else ""
     fn = fns[idx][1]
+    if kind == "empty" and (is_stub(fn) or only_raises(fn)):
+        sys.stdout.buffer.write(raw)  # it already does nothing: the baseline is the gutted run
+        raise SystemExit(0)
     lines = [l + "\n" for l in src.split("\n")]  # ast counts \n only; splitlines() would also split on \f,  …
     def off(lineno, col):  # col is a UTF-8 byte offset
         return sum(len(l) for l in lines[: lineno - 1]) + len(lines[lineno - 1].encode("utf-8")[:col].decode("utf-8"))
@@ -342,8 +370,8 @@ function py(python: string, args: string[], input?: string): string {
 
 /** `abs` is a file path, or pass the source text as `text` (for the base version of a file). */
 export function pyFunctions(python: string, file: string, abs: string, text?: string): Fn[] {
-  const list = JSON.parse(py(python, ['list', text === undefined ? abs : '-'], text)) as { name: string; line: number; end: number; index: number; fp: string }[];
-  return list.map((f) => ({ file, name: f.name, line: f.line, end: f.end, lang: 'py', index: f.index, fp: f.fp }));
+  const list = JSON.parse(py(python, ['list', text === undefined ? abs : '-'], text)) as { name: string; line: number; end: number; index: number; fp: string; inert: boolean }[];
+  return list.map((f) => ({ file, name: f.name, line: f.line, end: f.end, lang: 'py', index: f.index, fp: f.fp, inert: f.inert }));
 }
 
 export const pyMutant = (python: string, abs: string, fn: Fn, kind: Mutant, marker?: string) =>
