@@ -460,9 +460,12 @@ export async function check(opt: Options): Promise<Report> {
         continue;
       }
       if (!loaders.length) {
-        const importer = importedBy(file, sb.files, (f) => readFileSync(join(sb.dir, f), 'utf8'));
+        const importers = importedBy(file, sb.files, (f) => readFileSync(join(sb.dir, f), 'utf8'));
+        const failing = new Set([...rb.fail, ...fb.fail].map(testFile));
+        const live = importers.filter((f) => !failing.has(f));
         for (const fn of candidates)
-          if (importer) add(fn, 'UNVERIFIABLE', [], `${importer} imports this file, yet no test loaded the sandbox copy (a workspace link or an editable install?)`);
+          if (live.length) add(fn, 'UNVERIFIABLE', [], `${live[0]} imports this file, yet no test loaded the sandbox copy (a workspace link or an editable install?)`);
+          else if (importers.length) add(fn, 'UNVERIFIABLE', [], `the tests that import this file (${importers[0]}) already fail before any change, so they cannot notice anything`);
           else if (brokenNote) add(fn, 'UNVERIFIABLE', [], `no passing test loads this file, and ${brokenNote}`);
           else add(fn, 'UNTESTED', [], 'no test in the suite loads this file');
         continue;
@@ -518,14 +521,22 @@ function explain(r: Runner, run: Run, timeoutMs: number, file: string): string {
   return `${r.kind} exited ${run.code}: ${why.slice(0, 200)} (reproduce: ${repro})`;
 }
 
-/** A test file whose imports name this file, if any: evidence the runner should have related it. */
-function importedBy(file: string, files: string[], read: (f: string) => string): string | undefined {
-  if (PY_FILE.test(file)) return relatedPyTests(file, files, read)[0];
-  const name = basename(file).replace(JS_FILE, '');
-  const stem = name === 'index' ? basename(dirname(file)) : name;
-  const esc = stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`(?:from\\s*|require\\(\\s*|import\\(\\s*)['"][^'"]*\\b${esc}(?:/index)?(?:\\.[cm]?[jt]sx?)?['"]`);
-  return files.find((f) => JS_FILE.test(f) && /\.(?:test|spec)\.[^/]+$|(?:^|\/)__tests__\//.test(f) && re.test(read(f)));
+/** Test files whose import specifiers point at this file: evidence that some test means to load it. */
+function importedBy(file: string, files: string[], read: (f: string) => string): string[] {
+  if (PY_FILE.test(file)) return relatedPyTests(file, files, read);
+  const target = file.replace(JS_FILE, '');
+  const matches = (test: string, spec: string) => {
+    const s = spec.replace(JS_FILE, '').replace(/\/index$/, '');
+    if (s.startsWith('.')) {
+      const p = join(dirname(test), s);
+      return p === target || p === target.replace(/\/index$/, '');
+    }
+    // An alias such as @/lib/money or ~/lib/money: the rest must name the file's path, at least two segments of it.
+    const rest = s.replace(/^[@~#$]\//, '');
+    return rest.includes('/') && (`/${target}`.endsWith(`/${rest}`) || `/${target}`.endsWith(`/${rest}/index`));
+  };
+  const SPEC = /(?:from\s*|require\(\s*|import\(\s*)['"]([^'"]+)['"]/g;
+  return files.filter((f) => JS_FILE.test(f) && /\.(?:test|spec)\.[^/]+$|(?:^|\/)__tests__\//.test(f) && [...read(f).matchAll(SPEC)].some((m) => matches(f, m[1])));
 }
 
 /** What the guard compares between stops: the uncommitted diff, untracked files included. */
