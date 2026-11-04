@@ -93,7 +93,7 @@ The card names functions and the repo folder, so read it before you post it. Fun
 The author's own Next.js app, last commit (26 files, +2352 lines, written by an agent), on a laptop with no database running:
 
 ```
-Potemkin · 38 functions changed since HEAD~1 · vitest · 229 tests · 63 runs in 1m 52s
+Potemkin · 38 functions changed since HEAD~1 · vitest · 229 tests · 77 runs in 3m 50s
 
   NOTICED        23  a test failed with it gutted
   HOLLOW          0  tests run it, yet all pass with it gutted
@@ -105,7 +105,7 @@ Potemkin · 38 functions changed since HEAD~1 · vitest · 229 tests · 63 runs 
 39 tests already fail on the current code and were left out.
 ```
 
-The three untested functions are a React table no test renders. The twelve it would not judge sit behind integration tests that need Postgres, which was not running, so Potemkin said so instead of guessing.
+The three untested functions are a React table no test renders. The twelve it would not judge sit behind integration tests that need Postgres, which was not running, so Potemkin named those tests instead of guessing. The whole-suite confirmation step is what the extra two minutes buy.
 
 ## Guard: send the agent back before you read its diff
 
